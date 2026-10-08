@@ -99,9 +99,34 @@ docker compose -f wazuh/docker-compose.yml logs --tail 100
 `config --quiet`는 Compose 구문 검증이며 인증서 존재나 서비스 기동을
 보장하지 않습니다. Flask의 `/dashboard`와 Wazuh Dashboard는 별도 화면입니다.
 현재 `board-host`의 ID는 `001`이고 `default, flask-board` 그룹을 사용합니다.
-수업 자료의 `002` 대신 `001`로 검색합니다. 기존 그룹 설정은
-`C:\SKT aleph\flask-board\logs\security.log` 수집 및 `templates` 실시간
-감시를 포함합니다. FIM 경보는 `100220`, `100221`, `100222` 규칙으로 확인합니다.
+수업 자료의 `002` 대신 `001`로 검색합니다. `flask-board` 그룹 설정
+(`/var/ossec/etc/shared/flask-board/agent.conf`)은 게시판 프로젝트 루트 기준
+`logs\security.log` 수집과 `templates` 실시간 감시를 포함하며, 현재는
+`C:\gov\mini_practice\flask-board-team\flask-board\logs\security.log`와
+`C:\gov\mini_practice\flask-board-team\flask-board\templates`를 가리킵니다.
+FIM 경보는 `100220`, `100221`, `100222` 규칙으로 확인합니다.
+
+⚠️ **이 경로는 `RELOCATION-RUNBOOK.md`가 자동으로 갱신해 주지 않습니다.**
+프로젝트 폴더나 PC를 옮기면 `agent.conf`의 두 경로를 직접 고쳐야 합니다
+(안 고치면 로그 수집·FIM 감시가 예전 경로를 보면서 조용히 멈춥니다):
+
+```powershell
+docker exec -i wazuh-manager sh -c 'cat > /var/ossec/etc/shared/flask-board/agent.conf' <<'EOF'
+<agent_config os="Windows">
+  <localfile>
+    <location><새 프로젝트 루트>\logs\security.log</location>
+    <log_format>syslog</log_format>
+  </localfile>
+
+  <syscheck>
+    <directories realtime="yes" check_all="yes"><새 프로젝트 루트>\templates</directories>
+  </syscheck>
+</agent_config>
+EOF
+```
+
+적용 후에는 Windows 쪽 Wazuh 에이전트 서비스를 재시작해야 바로 반영됩니다
+(안 하면 다음 주기적 config 폴링까지 기다려야 합니다).
 
 실제 TLS 개인키와 Agent 키가 포함된 백업은 `.gitignore`로 제외합니다.
 수업 자료: https://app.notion.com/p/wazuh_4-9_-d730741730ea82ed95b881c8f214105f
