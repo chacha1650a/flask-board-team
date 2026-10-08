@@ -34,16 +34,13 @@ services:
       - "1515:1515/tcp"
 
     volumes:
-      # 기존 API 계정, Agent 그룹/DB, 사용자 스크립트도 재생성 후 유지
-      - wazuh_api_configuration:/var/ossec/api/configuration
+      # 기존 Manager 데이터 유지 (wazuh_4.9 Notion 문서 §1·§7 기준)
       - wazuh_etc:/var/ossec/etc
       - wazuh_logs:/var/ossec/logs
+
+      # 에이전트 그룹 소속(agent_groups)·global.db가 여기 저장됨.
+      # 영속화 안 하면 컨테이너 재생성마다 그룹 소속이 초기화된다 (2026-10-08 실측).
       - wazuh_queue:/var/ossec/queue
-      - wazuh_var_multigroups:/var/ossec/var/multigroups
-      - wazuh_integrations:/var/ossec/integrations
-      - wazuh_active_response:/var/ossec/active-response/bin
-      - wazuh_agentless:/var/ossec/agentless
-      - wazuh_wodles:/var/ossec/wodles
 
       # 추가: Filebeat 설정 보존
       - filebeat_etc:/etc/filebeat
@@ -150,34 +147,20 @@ networks:
 
   graylog_net:
     external: true
-    name: 9_graylog_default
+    name: 10_graylog_default
 
 volumes:
-  wazuh_api_configuration:
-    external: true
-    name: wazuh-lab_wazuh_api_configuration
+  # 기존 Manager 데이터 (wazuh_4.9 Notion 문서 §1·§7 기준 — 이 두 개만 유지 대상)
   wazuh_etc:
     external: true
     name: wazuh-lab_wazuh_etc
   wazuh_logs:
+    external: true
+    name: wazuh-lab_wazuh_logs
+
+  # 에이전트 그룹 소속(agent_groups)이 여기 저장됨 — 컨테이너 재생성에도 유지되도록
+  # 일반 named volume으로 선언 (external 아님, Compose가 자동 생성·재사용)
   wazuh_queue:
-    external: true
-    name: wazuh-lab_wazuh_queue
-  wazuh_var_multigroups:
-    external: true
-    name: wazuh-lab_wazuh_var_multigroups
-  wazuh_integrations:
-    external: true
-    name: wazuh-lab_wazuh_integrations
-  wazuh_active_response:
-    external: true
-    name: wazuh-lab_wazuh_active_response
-  wazuh_agentless:
-    external: true
-    name: wazuh-lab_wazuh_agentless
-  wazuh_wodles:
-    external: true
-    name: wazuh-lab_wazuh_wodles
 
   # 추가
   filebeat_etc:
