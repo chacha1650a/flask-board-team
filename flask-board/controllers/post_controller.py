@@ -1,92 +1,116 @@
+"""게시글 CRUD (RESTful). 쓰기/수정/삭제는 JWT 로그인 필요."""
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
-from controllers.authz import current_user
 from extensions import db
-from models import ROLE_ADMIN, Post
+from models import Post
 
-post_bp = Blueprint("post", __name__, url_prefix="/api/posts")
+post_bp = Blueprint('post', __name__, url_prefix='/api/posts')
 
 
-@post_bp.get("")
+@post_bp.route('', methods=['GET'])
 def get_posts():
-    cursor = request.args.get("cursor", type=int)
-    requested_limit = request.args.get("limit", default=5, type=int)
-    limit = min(max(requested_limit if requested_limit is not None else 5, 1), 50)
-    search = request.args.get("search", default="", type=str)
-    category = request.args.get("category", default="", type=str)
+    limit = int(request.args.get('limit', 5))
+    cursor = request.args.get('cursor', type=int)
+    search = request.args.get('search', '')
+    category = request.args.get('category', '전체')
+
     query = Post.query
-    if category and category != "전체":
+
+    # 카테고리 필터
+    if category and category != '전체':
         query = query.filter(Post.category == category)
+
+    # 검색어 필터 (제목 또는 내용)
     if search:
-        query = query.filter(
-            (Post.title.like(f"%{search}%")) | (Post.content.like(f"%{search}%"))
-        )
+        search_term = f"%{search}%"
+        query = query.filter((Post.title.like(search_term)) | (Post.content.like(search_term)))
+
+    # 커서 페이징 처리 (ID 내림차순 기준)
     if cursor:
         query = query.filter(Post.id < cursor)
-    posts = query.order_by(Post.id.desc()).limit(limit + 1).all()
-    has_more = len(posts) > limit
-    posts = posts[:limit]
+
+    query = query.order_by(Post.id.desc())
+
+    # 지정한 limit보다 1개 더 가져와서 다음 페이지 존재 여부 확인
+    posts = query.limit(limit + 1).all()
+
+    has_more = False
+    next_cursor = None
+    if len(posts) > limit:
+        has_more = True
+        posts = posts[:-1]  # 초과분 제거
+        next_cursor = posts[-1].id
+
+    posts_list = []
+    for post in posts:
+        posts_list.append({
+            'id': post.id,
+            'title': post.title,
+            'content': post.content,
+            'category': post.category,
+            'author': post.author.username if post.author else 'Unknown'
+        })
+
     return jsonify({
-        "posts": [post.to_dict() for post in posts],
-        "next_cursor": posts[-1].id if has_more else None,
-        "has_more": has_more,
+        'posts': posts_list,
+        'has_more': has_more,
+        'next_cursor': next_cursor
     })
 
 
-@post_bp.post("")
+@post_bp.route('', methods=['POST'])
 @jwt_required()
 def create_post():
-    user_id = int(get_jwt_identity())
-    data = request.get_json(silent=True) or {}
-    if not data.get("title") or not data.get("content"):
-        return jsonify({"msg": "title, content는 필수입니다."}), 400
-    post = Post(
-        title=str(data["title"])[:200], content=str(data["content"]),
-        category=str(data.get("category") or "일반")[:50], author_id=user_id,
+    current_user_id = get_jwt_identity()
+    data = request.get_json()
+
+    title = data.get('title')
+    content = data.get('content')
+    category = data.get('category', '일반')
+
+    if not title or not content:
+        return jsonify({"msg": "제목과 내용을 모두 입력해주세요."}), 400
+
+    new_post = Post(
+        title=title,
+        content=content,
+        category=category,
+        author_id=current_user_id
     )
-    db.session.add(post)
+    db.session.add(new_post)
     db.session.commit()
-    return jsonify({"msg": "게시글이 등록되었습니다.", "id": post.id}), 201
+
+    return jsonify({"msg": "게시글이 등록되었습니다."}), 201
 
 
-@post_bp.put("/<int:post_id>")
+@post_bp.route('/<int:id>', methods=['PUT'])
 @jwt_required()
-def update_post(post_id):
-    user_id = int(get_jwt_identity())
-    post = db.get_or_404(Post, post_id)
-    if post.author_id != user_id:
-        return jsonify({"msg": "권한이 없습니다."}), 403
-    data = request.get_json(silent=True) or {}
-    post.title = str(data.get("title", post.title))[:200]
-    post.content = str(data.get("content", post.content))
-    post.category = str(data.get("category", post.category))[:50]
+def update_post(id):
+    current_user_id = get_jwt_identity()
+    post = Post.query.get_or_404(id)
+
+    if str(post.author_id) != str(current_user_id):
+        return jsonify({"msg": "수정 권한이 없습니다."}), 403
+
+    data = request.get_json()
+    post.title = data.get('title', post.title)
+    post.content = data.get('content', post.content)
+    post.category = data.get('category', post.category)
+
     db.session.commit()
-    return jsonify({"msg": "수정되었습니다."})
+    return jsonify({"msg": "게시글이 수정되었습니다."}), 200
 
 
-@post_bp.delete("/<int:post_id>")
+@post_bp.route('/<int:id>', methods=['DELETE'])
 @jwt_required()
-def delete_post(post_id):
-    """작성자 본인, 그리고 관리자(2)가 삭제할 수 있다.
+def delete_post(id):
+    current_user_id = get_jwt_identity()
+    post = Post.query.get_or_404(id)
 
-    수정은 여전히 본인만 가능하다. 관리자에게 준 것은 부적절한 글을 내리는
-    삭제 권한이지, 남의 글 내용을 바꾸는 권한이 아니다.
-    """
-    user = current_user()
-    if user is None:
-        # 토큰은 살아 있는데 계정이 삭제된 경우
-        return jsonify({"msg": "로그인이 필요합니다."}), 401
-    post = db.get_or_404(Post, post_id)
-    is_owner = post.author_id == user.id
-    is_moderator = user.role >= ROLE_ADMIN
-    if not (is_owner or is_moderator):
-        return jsonify({"msg": "권한이 없습니다."}), 403
-    author = post.author.username
+    if str(post.author_id) != str(current_user_id):
+        return jsonify({"msg": "삭제 권한이 없습니다."}), 403
+
     db.session.delete(post)
     db.session.commit()
-    if is_owner:
-        return jsonify({"msg": "삭제되었습니다.", "moderated": False})
-    return jsonify(
-        {"msg": f"관리자 권한으로 {author}님의 글을 삭제했습니다.", "moderated": True}
-    )
+    return jsonify({"msg": "게시글이 삭제되었습니다."}), 200

@@ -1,192 +1,136 @@
-"""Flask 게시판 엔트리포인트."""
-import secrets
+"""엔트리포인트 — 앱 팩토리(create_app) 패턴.
 
+구조
+  config.py       설정(.env 로딩)
+  extensions.py   db · jwt 인스턴스
+  models/         User · Post · SecurityEvent · BlockedIP
+  controllers/    page · auth · post · gold · admin · security · public (블루프린트)
+  templates/      화면 (partials/_nav.html = 공통 반응형 헤더)
+
+실행:  python app.py   →  http://localhost:5000
+"""
+import os
+
+import click
 from flask import Flask, jsonify, request
-from sqlalchemy import Integer, inspect, text
+from sqlalchemy import inspect, text
 
 from config import Config
 from controllers import all_blueprints
 from controllers.gelf import send_gelf
+from controllers.rbac import client_ip
 from controllers.seclog import write_404log
 from extensions import db, jwt
-from models import BlockedIP
+from models import BlockedIP, User
+from models.user import ROLE_GENERAL, ROLE_LABELS
 
 
-def _client_ip():
-    """랩 프록시 뒤에서 전달된 첫 IP를 사용하고, 없으면 직접 접속 IP를 쓴다."""
-    forwarded_for = request.headers.get("X-Forwarded-For", "")
-    if forwarded_for:
-        return forwarded_for.split(",", 1)[0].strip()
-    return request.remote_addr or ""
-
-
-def _ensure_user_security_schema():
-    """기존 users 테이블에도 새 계정 잠금 컬럼을 한 번만 보강한다."""
-    columns = {column["name"] for column in inspect(db.engine).get_columns("users")}
-    additions = {
-        "role_granted_by": (
-            "ALTER TABLE users ADD COLUMN role_granted_by VARCHAR(80) NULL"
-        ),
-        "role_granted_at": (
-            "ALTER TABLE users ADD COLUMN role_granted_at DATETIME NULL"
-        ),
-        "role_reason": (
-            "ALTER TABLE users ADD COLUMN role_reason VARCHAR(200) NULL"
-        ),
-        "is_locked": (
-            "ALTER TABLE users ADD COLUMN is_locked BOOLEAN NOT NULL DEFAULT 0"
-        ),
-        "locked_at": "ALTER TABLE users ADD COLUMN locked_at DATETIME NULL",
-        "lock_reason": "ALTER TABLE users ADD COLUMN lock_reason VARCHAR(200) NULL",
-        "failed_logins": (
-            "ALTER TABLE users ADD COLUMN failed_logins INTEGER NOT NULL DEFAULT 0"
-        ),
+def _ensure_schema():
+    """이미 만들어져 있던 users/security_events 테이블에는 새로 추가한 컬럼이
+    없을 수 있으므로(기존 실습 DB에 데이터가 남아있는 경우) 자동으로 추가해준다."""
+    inspector = inspect(db.engine)
+    tables = inspector.get_table_names()
+    column_adds = {
+        'users': {
+            'role': f'ALTER TABLE users ADD COLUMN role INTEGER NOT NULL DEFAULT {ROLE_GENERAL}',
+            'role_granted_by': 'ALTER TABLE users ADD COLUMN role_granted_by VARCHAR(80) NULL',
+            'role_granted_at': 'ALTER TABLE users ADD COLUMN role_granted_at DATETIME NULL',
+            'role_reason': 'ALTER TABLE users ADD COLUMN role_reason VARCHAR(200) NULL',
+        },
+        'security_events': {
+            'source': 'ALTER TABLE security_events ADD COLUMN source VARCHAR(50) NULL',
+            'level': 'ALTER TABLE security_events ADD COLUMN level INTEGER NULL',
+            'rule': 'ALTER TABLE security_events ADD COLUMN rule VARCHAR(50) NULL',
+        },
     }
-    with db.engine.begin() as connection:
-        for name, statement in additions.items():
-            if name not in columns:
-                connection.execute(text(statement))
-
-
-def _ensure_user_role_schema():
-    """이전 게시판의 문자열 등급을 현재 숫자 등급으로 한 번만 변환한다.
-
-    예전 DB는 ``user/gold/admin``을 VARCHAR로 저장했지만 현재 애플리케이션은
-    ``0/1/2`` 정수 등급을 사용한다. SQLAlchemy의 ``create_all``은 기존 컬럼의
-    타입을 바꾸지 않으므로 시작 시 명시적으로 마이그레이션한다.
-    """
-    role_column = next(
-        column
-        for column in inspect(db.engine).get_columns("users")
-        if column["name"] == "role"
-    )
-    if isinstance(role_column["type"], Integer):
-        return
-
-    if db.engine.dialect.name not in {"mysql", "mariadb"}:
-        raise RuntimeError(
-            "users.role이 숫자 컬럼이 아닙니다. DB 마이그레이션이 필요합니다."
-        )
-
-    with db.engine.begin() as connection:
-        connection.execute(
-            text(
-                """
-                UPDATE users
-                SET role = CASE LOWER(TRIM(CAST(role AS CHAR)))
-                    WHEN 'admin' THEN '2'
-                    WHEN 'gold' THEN '1'
-                    WHEN 'user' THEN '0'
-                    WHEN '2' THEN '2'
-                    WHEN '1' THEN '1'
-                    ELSE '0'
-                END
-                """
-            )
-        )
-        connection.execute(
-            text(
-                "ALTER TABLE users "
-                "MODIFY COLUMN role INTEGER NOT NULL DEFAULT 0"
-            )
-        )
+    with db.engine.begin() as conn:
+        for table, adds in column_adds.items():
+            if table not in tables:
+                continue
+            existing = {c['name'] for c in inspector.get_columns(table)}
+            for name, ddl in adds.items():
+                if name not in existing:
+                    conn.execute(text(ddl))
 
 
 def create_app(config_class=Config):
     app = Flask(__name__)
     app.config.from_object(config_class)
 
-    if not app.config.get("SQLALCHEMY_DATABASE_URI"):
-        raise RuntimeError(
-            "DATABASE_URL이 없습니다. .env.example을 .env로 복사해 DB 접속값을 설정하세요."
-        )
-    if not app.config.get("JWT_SECRET_KEY"):
-        raise RuntimeError(
-            "JWT_SECRET_KEY가 없습니다. .env에 긴 랜덤 문자열을 설정하세요."
-        )
-
+    # 확장 초기화
     db.init_app(app)
     jwt.init_app(app)
-    for blueprint in all_blueprints:
-        app.register_blueprint(blueprint)
 
+    # 컨트롤러(블루프린트) 등록
+    for bp in all_blueprints:
+        app.register_blueprint(bp)
+
+    # 테이블 생성 (models 를 import 한 뒤여야 한다 — controllers 가 이미 import 함)
     with app.app_context():
         db.create_all()
-        _ensure_user_security_schema()
-        _ensure_user_role_schema()
-
-    def is_trusted_automation():
-        """보안·관리자 API 키가 맞는 요청인가(SOAR 봇 판별). 키가 비면 아무도 믿지 않는다."""
-        supplied = request.headers.get("X-API-Key", "")
-        if not supplied:
-            return False
-        valid_keys = {
-            app.config.get("SECURITY_API_KEY") or "",
-            app.config.get("ADMIN_API_KEY") or "",
-        } - {""}
-        return any(secrets.compare_digest(supplied, key) for key in valid_keys)
+        _ensure_schema()
 
     @app.before_request
-    def block_ip_guard():
-        """차단 목록에 있는 IP의 일반 요청을 컨트롤러 실행 전에 거부한다."""
-        # 복구가 불가능해지는 상황을 막기 위해 관리자 대응 API는 예외로 둔다.
-        if request.path.startswith("/api/admin"):
+    def _block_ip_guard():
+        """실차단(active response): 차단된 IP 의 요청은 앱에 닿기 전에 403 으로 되돌린다.
+
+        - 관리자 API(/api/admin/*) 는 예외 — 그래야 운영자·n8n 이 차단/해제를 계속 할 수 있다
+          (자기 자신을 잠가 복구 불능이 되는 것을 막는 안전장치).
+        - 매 요청 blocked_ips 표를 조회한다. 랩 규모에선 충분하고, 실서비스는
+          캐시(예: Redis)나 방화벽(nftables) 계층으로 올려야 한다."""
+        if request.path.startswith('/api/admin'):
             return None
-        # 인증된 자동화 요청도 예외다. SOAR가 127.0.0.1을 차단하면 같은 PC의
-        # 경보봇이 /api/security/events 기록까지 403을 맞는 자기차단이 생긴다
-        # (강사님 2026-09-24 실측). 틀린 키는 여기서 걸러지지 않는다.
-        if is_trusted_automation():
-            return None
-        client_ip = _client_ip()
-        if client_ip and db.session.get(BlockedIP, client_ip):
-            # S5 지속성 탐지: 403만 주고 끝내면 공격이 멈췄는지 알 수 없다.
-            send_gelf(
-                f"blocked ip retried {request.path[:80]}",
-                rule="blocked-retry",
-                src_ip=client_ip,
-                path=request.path[:120],
-                code=403,
-            )
-            return (
-                jsonify(
-                    {
-                        "msg": "차단된 IP입니다. 관리자에게 문의하세요.",
-                        "ip": client_ip,
-                        "blocked": True,
-                    }
-                ),
-                403,
-            )
+        ip = client_ip()
+        if ip and db.session.get(BlockedIP, ip):
+            return jsonify({"msg": "차단된 IP 입니다(관리자에게 문의).", "ip": ip, "blocked": True}), 403
         return None
 
     @app.after_request
-    def web_scan_probe(response):
-        """없는 경로의 404를 Wazuh security.log와 Graylog 양쪽에 남긴다.
-
-        Wazuh(룰 100230/100231)와 Graylog가 각각 출발지별 404 폭주를 집계한다.
-        """
-        if response.status_code != 404 or request.path.startswith("/api/admin"):
+    def _web_scan_probe(response):
+        """스캐너(nikto·gobuster 등)는 없는 경로에 404 를 대량 유발한다.
+        404 를 ① Wazuh security.log 기록 + ② GELF(rule='web-scan') 신고
+        → 호스트 센서(Wazuh)와 SIEM(Graylog) 두 경로가 함께 '한 IP 404 폭주'를 탐지.
+        관리자 API(/api/admin) 는 운영·n8n 트래픽 오탐 방지를 위해 제외한다.
+        (after_request 훅은 예외를 던지면 안 되므로 각 단계를 따로 감싼다.)"""
+        if response.status_code != 404 or request.path.startswith('/api/admin'):
             return response
 
-        client_ip = _client_ip()
+        ip = client_ip()
         path = request.path[:120]
+
+        # ① Wazuh 에이전트가 읽는 security.log 기록
         try:
-            write_404log(client_ip, path)
+            write_404log(ip, path)
         except Exception:
-            # 로그 기록 장애가 원래 HTTP 응답을 바꾸지 않도록 한다.
-            app.logger.warning("Wazuh http_404 log could not be written.")
+            pass
+
+        # ② Graylog GELF 신고(404 집계 및 n8n 자동 차단)
         try:
-            send_gelf(
-                f"404 probe {path[:80]}",
-                rule="web-scan",
-                src_ip=client_ip,
-                path=path,
-                code=404,
-            )
+            send_gelf(f"404 probe {path[:80]}", rule='web-scan',
+                      src_ip=ip, path=path, code=404)
         except Exception:
-            # 로그 전송 장애가 원래 HTTP 응답을 바꾸지 않도록 한다.
-            app.logger.warning("Graylog web-scan log could not be sent.")
+            pass
         return response
+
+    # ----------------- 최초 관리자 부트스트랩용 CLI -----------------
+    # 회원가입은 항상 '일반' 등급으로만 생성되므로, 맨 처음 관리자 계정을 만들려면
+    # 이 CLI 로 등급을 직접 올려야 한다. (등급 변경용 API 를 인증 없이 열어두면
+    # 그 자체가 취약점이 되므로 서버 콘솔에만 존재하는 CLI 명령으로 제공한다.)
+    # 사용법: flask --app app.py set-role <아이디> <등급 0/1/2>
+    @app.cli.command('set-role')
+    @click.argument('username')
+    @click.argument('role', type=int)
+    def set_role_command(username, role):
+        if role not in ROLE_LABELS:
+            click.echo('role 은 0(일반)/1(골드)/2(관리자) 중 하나여야 합니다.')
+            return
+        user = User.query.filter_by(username=username).first()
+        if not user:
+            click.echo(f'{username} 사용자를 찾을 수 없습니다.')
+            return
+        user.role = role
+        db.session.commit()
+        click.echo(f'{username} 님의 등급을 {ROLE_LABELS[role]}({role}) 로 변경했습니다.')
 
     return app
 
@@ -194,5 +138,19 @@ def create_app(config_class=Config):
 app = create_app()
 
 
-if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+if __name__ == '__main__':
+    # n8n 은 도커 컨테이너 안에 있으므로, 호스트의 127.0.0.1 에만 바인딩하면
+    # 컨테이너에서 host.docker.internal 로 들어와도 'Connection refused' 가 난다.
+    # 따라서 0.0.0.0 으로 열어 둔다.
+    #
+    # 주의: 0.0.0.0 + debug=True 는 Werkzeug 디버거가 같은 네트워크에 노출되어
+    #       원격 코드 실행으로 이어질 수 있다. 그래서 debug 는 기본을 끄고,
+    #       필요할 때만 FLASK_DEBUG=1 로 켜되 신뢰된 망에서만 쓴다.
+    host  = os.getenv("FLASK_HOST", "0.0.0.0")
+    port  = int(os.getenv("FLASK_PORT", "5000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1"
+
+    if debug and host == "0.0.0.0":
+        print("[경고] debug=True 인 채로 0.0.0.0 에 바인딩합니다. 공용 네트워크에서는 쓰지 마세요.")
+
+    app.run(host=host, port=port, debug=debug)

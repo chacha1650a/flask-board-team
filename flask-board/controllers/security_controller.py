@@ -1,222 +1,163 @@
-"""n8n 판정 결과를 저장하고 조회하는 보안 이벤트 API."""
-import os
-import secrets
-from functools import wraps
+"""보안 이벤트 수집 API (과제 4) — n8n 이 판정 결과를 보내 저장하는 곳.
+
+n8n 컨테이너 -> 호스트의 이 서버로 POST 된다.
+컨테이너 안에서 localhost 는 컨테이너 자신이므로, n8n 쪽 URL 은
+  http://host.docker.internal:5000/api/security/events
+를 써야 한다. (문제지 과제 4 힌트)
+"""
+import hmac
 
 from flask import Blueprint, current_app, jsonify, request
-from sqlalchemy import func
-from werkzeug.security import generate_password_hash
 
-from controllers.gelf import request_src_ip, send_gelf
 from extensions import db
-from models import Incident, Post, SecurityEvent, User
+from models import Incident, SecurityEvent
 
-security_bp = Blueprint("security", __name__, url_prefix="/api/security")
+security_bp = Blueprint('security', __name__, url_prefix='/api/security')
 
-
-def require_api_key(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        expected = current_app.config.get("SECURITY_API_KEY", "")
-        supplied = request.headers.get("X-API-Key", "")
-        if not expected or not secrets.compare_digest(supplied, expected):
-            # S6 인증 공격 탐지. 시도된 키 값은 그 자체가 비밀 후보라 남기지 않는다.
-            send_gelf(
-                f"admin api auth failed {request.path[:80]}",
-                rule="admin-auth-fail",
-                src_ip=request_src_ip(),
-                path=request.path[:120],
-                code=401,
-            )
-            return jsonify({"msg": "API 키가 없거나 잘못되었습니다."}), 401
-        return fn(*args, **kwargs)
-    return wrapper
+REQUIRED_EVENT_FIELDS = ("student", "src_ip", "decision")
 
 
-def _optional_int(data, field, default=None):
-    value = data.get(field, default)
-    if value in (None, ""):
-        return default
+def _check_api_key():
+    """인증 실패 사유를 담은 응답을 돌려주고, 통과면 None 을 돌려준다."""
+    expected = current_app.config.get("SECURITY_API_KEY")
+    if not expected:
+        # 서버가 키를 설정하지 않은 상태 — 인증을 통과시키면 안 된다
+        return jsonify({"msg": "서버에 SECURITY_API_KEY 가 설정되지 않았습니다."}), 500
+    sent = request.headers.get("X-API-Key")
+    if not sent:
+        return jsonify({"msg": "X-API-Key 헤더가 없습니다."}), 401
+    # 타이밍 공격을 피하려고 단순 == 대신 상수시간 비교를 쓴다
+    if not hmac.compare_digest(sent, expected):
+        return jsonify({"msg": "X-API-Key 가 올바르지 않습니다."}), 401
+    return None
+
+
+def _as_int(v):
     try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field}는 정수여야 합니다.") from exc
+        return int(v)
+    except (TypeError, ValueError):
+        return None
 
 
-def _create_security_post(event):
-    bot = User.query.filter_by(username="soarbot").first()
-    if not bot:
-        bot = User(
-            username="soarbot",
-            password=generate_password_hash(os.urandom(16).hex()),
-        )
-        db.session.add(bot)
-        db.session.flush()
-    post = Post(
-        title=f"[보안][{event.student}] {event.src_ip} 접근 거부 ({event.severity})",
-        content=(
-            f"{event.reason or ''}\n시도 계정: {event.users or '-'}\n"
-            f"마지막 시도: {event.last_seen or '-'}\n수집: {event.generated_at or '-'}"
-        ),
-        category="보안",
-        author_id=bot.id,
-    )
-    db.session.add(post)
-    db.session.flush()
-    return post.id
-
-
-@security_bp.post("/events")
-@require_api_key
+@security_bp.route('/events', methods=['POST'])
 def create_security_event():
-    data = request.get_json(silent=True) or {}
-    student = str(data.get("student") or "").strip()
-    src_ip = str(data.get("src_ip") or "").strip()
-    decision = str(data.get("decision") or "").strip().lower()
-    if not student or not src_ip or decision not in ("allow", "deny"):
-        return jsonify({"msg": "student, src_ip, decision(allow|deny)은 필수입니다."}), 400
-    try:
-        fail_count = _optional_int(data, "fail_count", 0)
-        window_min = _optional_int(data, "window_min")
-    except ValueError as exc:
-        return jsonify({"msg": str(exc)}), 400
-    if fail_count < 0 or (window_min is not None and window_min < 0):
-        return jsonify({"msg": "fail_count와 window_min은 음수일 수 없습니다."}), 400
+    # ① 인증 먼저 (D1·D2 순서: 키가 틀리면 본문 검증 전에 401)
+    denied = _check_api_key()
+    if denied:
+        return denied
 
+    # ② 본문 검증
+    data = request.get_json(silent=True) or {}
+    missing = [f for f in REQUIRED_EVENT_FIELDS if not data.get(f)]
+    if missing:
+        return jsonify({"msg": "필수값 누락", "missing": missing}), 400
+
+    if data["decision"] not in ("allow", "deny"):
+        return jsonify({"msg": "decision 은 allow 또는 deny 여야 합니다."}), 400
+
+    # ③ 저장
     event = SecurityEvent(
-        student=student[:50], src_ip=src_ip[:45], fail_count=fail_count,
-        decision=decision, severity=str(data.get("severity") or "Low")[:10],
-        reason=str(data.get("reason") or "")[:200] or None,
-        users=str(data.get("users") or "")[:255] or None,
-        last_seen=str(data.get("last_seen") or "")[:32] or None,
-        window_min=window_min,
-        source=str(data.get("source") or "login_guard")[:50],
-        generated_at=str(data.get("generated_at") or "")[:32] or None,
+        student    = str(data["student"])[:80],
+        src_ip     = str(data["src_ip"])[:45],
+        decision   = data["decision"],
+        severity   = (data.get("severity") or "Low"),
+        reason     = (str(data["reason"])[:255] if data.get("reason") else None),
+        level      = _as_int(data.get("level")),
+        rule       = (str(data["rule"])[:50] if data.get("rule") else None),
+        fail_count = _as_int(data.get("fail_count")) or 0,
+        source     = (str(data["source"])[:50] if data.get("source") else None),
     )
     db.session.add(event)
-    db.session.flush()
-    post_id = None
-    if decision == "deny" and current_app.config.get("AUTO_POST_ON_DENY"):
-        post_id = _create_security_post(event)
     db.session.commit()
-    return jsonify({
-        "id": event.id, "student": event.student,
-        "decision": event.decision, "post_id": post_id,
-    }), 201
+    return jsonify(event.to_dict()), 201
 
 
-@security_bp.get("/events")
+@security_bp.route('/events', methods=['GET'])
 def list_security_events():
-    student = request.args.get("student", type=str)
-    decision = request.args.get("decision", type=str)
-    source = request.args.get("source", type=str)
-    keyword = (request.args.get("q", type=str) or "").strip()
-    requested_limit = request.args.get("limit", default=20, type=int)
-    limit = min(max(requested_limit if requested_limit is not None else 20, 1), 100)
-    offset = max(request.args.get("offset", default=0, type=int) or 0, 0)
+    """이벤트 조회 (인증 없음). student 를 주면 본인 것만, 없으면 전체(대시보드용)."""
+    student = request.args.get("student")
+    decision = request.args.get("decision")
+    limit = min(request.args.get("limit", default=20, type=int) or 20, 100)
+
     query = SecurityEvent.query
     if student:
         query = query.filter_by(student=student)
     if decision in ("allow", "deny"):
         query = query.filter_by(decision=decision)
-    if source:
-        query = query.filter_by(source=source)
-    if keyword:
-        # 대시보드 검색창 하나로 사유·대상 계정·출발지 IP를 함께 찾는다.
-        pattern = f"%{keyword[:100]}%"
-        query = query.filter(
-            db.or_(
-                SecurityEvent.reason.like(pattern),
-                SecurityEvent.users.like(pattern),
-                SecurityEvent.src_ip.like(pattern),
-            )
-        )
-    total = query.count()
-    rows = query.order_by(SecurityEvent.id.desc()).offset(offset).limit(limit).all()
-    return jsonify({
-        "count": len(rows),
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "events": [row.to_dict() for row in rows],
-    })
+
+    rows = (query
+            .order_by(SecurityEvent.created_at.desc(), SecurityEvent.id.desc())
+            .limit(limit)
+            .all())
+    return jsonify({"student": student, "count": len(rows),
+                    "events": [r.to_dict() for r in rows]}), 200
 
 
-@security_bp.get("/events/summary")
-def security_events_summary():
-    student = request.args.get("student", type=str)
-    counts = db.session.query(SecurityEvent.decision, func.count(SecurityEvent.id))
-    sources = db.session.query(SecurityEvent.source, func.count(SecurityEvent.id))
-    event_count = func.count(SecurityEvent.id)
-    fail_sum = func.coalesce(func.sum(SecurityEvent.fail_count), 0)
-    top_ips = db.session.query(SecurityEvent.src_ip, event_count, fail_sum).filter(
-        SecurityEvent.decision == "deny"
-    )
+@security_bp.route('/events/summary', methods=['GET'])
+def security_event_summary():
+    """(심화 S1) 허용/거부 건수와 거부 상위 IP. student 없으면 전체 집계."""
+    student = request.args.get("student")
+
+    q1 = db.session.query(SecurityEvent.decision, db.func.count(SecurityEvent.id))
+    q2 = (db.session.query(SecurityEvent.src_ip, db.func.sum(SecurityEvent.fail_count).label("c"))
+          .filter(SecurityEvent.decision == "deny"))
     if student:
-        counts = counts.filter(SecurityEvent.student == student)
-        sources = sources.filter(SecurityEvent.student == student)
-        top_ips = top_ips.filter(SecurityEvent.student == student)
-    by_decision = dict(counts.group_by(SecurityEvent.decision).all())
-    by_source = {
-        (name or "unknown"): total
-        for name, total in sources.group_by(SecurityEvent.source).all()
-    }
-    # 권한 회수 이벤트는 실패 횟수가 0이라, 실패 합계만으로 줄 세우면 순위가 무의미하다.
-    # 거부 건수를 먼저 보고 실패 합계로 동률을 가른다.
-    top = (
-        top_ips.group_by(SecurityEvent.src_ip)
-        .order_by(event_count.desc(), fail_sum.desc())
-        .limit(5).all()
-    )
+        q1 = q1.filter(SecurityEvent.student == student)
+        q2 = q2.filter(SecurityEvent.student == student)
+
+    by_decision = dict(q1.group_by(SecurityEvent.decision).all())
+    top_deny = (q2.group_by(SecurityEvent.src_ip)
+                .order_by(db.desc("c"))
+                .limit(5).all())
     return jsonify({
         "student": student,
         "by_decision": by_decision,
-        "by_source": by_source,
-        "top_deny_ips": [
-            {"src_ip": ip, "events": int(events), "fails": int(fails)}
-            for ip, events, fails in top
-        ],
-    })
+        "top_deny_ips": [{"src_ip": ip, "fails": int(c or 0)} for ip, c in top_deny],
+    }), 200
 
 
-@security_bp.get("/incidents")
+@security_bp.route('/incidents', methods=['GET'])
 def list_security_incidents():
-    """대시보드용 인시던트 티켓 목록. 이벤트 조회처럼 읽기만 키 없이 연다.
+    """인시던트 티켓 목록 — 조회는 키 없이(대시보드가 쓴다).
 
-    생성·종료는 관리자 키가 필요한 /api/admin/incident 쪽에 그대로 둔다.
+    생성/종료는 그대로 관리자 키/JWT 가 필요한 /api/admin/incident 쪽이다(읽기 전용).
+    ?status=open|closed · ?student= · ?limit=(최대 100)
     """
-    status = request.args.get("status", type=str)
-    student = request.args.get("student", type=str)
-    requested_limit = request.args.get("limit", default=20, type=int)
-    limit = min(max(requested_limit if requested_limit is not None else 20, 1), 100)
+    status = request.args.get("status")
+    student = request.args.get("student")
+    limit = min(request.args.get("limit", default=20, type=int) or 20, 100)
+
     query = Incident.query
     if status in ("open", "closed"):
         query = query.filter_by(status=status)
     if student:
         query = query.filter_by(student=student)
+
     rows = query.order_by(Incident.id.desc()).limit(limit).all()
-    return jsonify({"count": len(rows), "incidents": [row.to_dict() for row in rows]})
+    return jsonify({"count": len(rows), "incidents": [r.to_dict() for r in rows]}), 200
 
 
-@security_bp.get("/incidents/summary")
+@security_bp.route('/incidents/summary', methods=['GET'])
 def security_incidents_summary():
-    """상태별 티켓 수와 열린 티켓의 심각도 분포(대시보드 카드용)."""
-    student = request.args.get("student", type=str)
-    by_status = db.session.query(Incident.status, func.count(Incident.id))
-    open_by_severity = db.session.query(
-        Incident.severity, func.count(Incident.id)
-    ).filter(Incident.status == "open")
+    """상태별 티켓 수 + 열린 티켓의 심각도 분포(대시보드 카드용)."""
+    student = request.args.get("student")
+
+    q1 = db.session.query(Incident.status, db.func.count(Incident.id))
+    q2 = (db.session.query(Incident.severity, db.func.count(Incident.id))
+          .filter(Incident.status == "open"))
     if student:
-        by_status = by_status.filter(Incident.student == student)
-        open_by_severity = open_by_severity.filter(Incident.student == student)
+        q1 = q1.filter(Incident.student == student)
+        q2 = q2.filter(Incident.student == student)
+
     return jsonify({
-        "student": student,
-        "by_status": dict(by_status.group_by(Incident.status).all()),
-        "open_by_severity": dict(open_by_severity.group_by(Incident.severity).all()),
-    })
+        "by_status": dict(q1.group_by(Incident.status).all()),
+        "open_by_severity": dict(q2.group_by(Incident.severity).all()),
+    }), 200
 
 
-@security_bp.get("/students")
-def list_students():
-    rows = db.session.query(SecurityEvent.student).distinct().order_by(SecurityEvent.student).all()
-    return jsonify({"students": [row[0] for row in rows]})
+@security_bp.route('/students', methods=['GET'])
+def list_security_students():
+    """대시보드 드롭다운용 — 기록이 있는 학생 목록."""
+    rows = (db.session.query(SecurityEvent.student)
+            .distinct().order_by(SecurityEvent.student).all())
+    return jsonify({"students": [r[0] for r in rows]}), 200
