@@ -7,6 +7,7 @@ from sqlalchemy import Integer, inspect, text
 from config import Config
 from controllers import all_blueprints
 from controllers.gelf import send_gelf
+from controllers.seclog import write_404log
 from extensions import db, jwt
 from models import BlockedIP
 
@@ -160,19 +161,31 @@ def create_app(config_class=Config):
 
     @app.after_request
     def web_scan_probe(response):
-        """없는 경로의 404를 신고해 Graylog가 출발지별 스캔을 집계하게 한다."""
-        if response.status_code == 404 and not request.path.startswith("/api/admin"):
-            try:
-                send_gelf(
-                    f"404 probe {request.path[:80]}",
-                    rule="web-scan",
-                    src_ip=_client_ip(),
-                    path=request.path[:120],
-                    code=404,
-                )
-            except Exception:
-                # 로그 전송 장애가 원래 HTTP 응답을 바꾸지 않도록 한다.
-                app.logger.warning("Graylog web-scan log could not be sent.")
+        """없는 경로의 404를 Wazuh security.log와 Graylog 양쪽에 남긴다.
+
+        Wazuh(룰 100230/100231)와 Graylog가 각각 출발지별 404 폭주를 집계한다.
+        """
+        if response.status_code != 404 or request.path.startswith("/api/admin"):
+            return response
+
+        client_ip = _client_ip()
+        path = request.path[:120]
+        try:
+            write_404log(client_ip, path)
+        except Exception:
+            # 로그 기록 장애가 원래 HTTP 응답을 바꾸지 않도록 한다.
+            app.logger.warning("Wazuh http_404 log could not be written.")
+        try:
+            send_gelf(
+                f"404 probe {path[:80]}",
+                rule="web-scan",
+                src_ip=client_ip,
+                path=path,
+                code=404,
+            )
+        except Exception:
+            # 로그 전송 장애가 원래 HTTP 응답을 바꾸지 않도록 한다.
+            app.logger.warning("Graylog web-scan log could not be sent.")
         return response
 
     return app
