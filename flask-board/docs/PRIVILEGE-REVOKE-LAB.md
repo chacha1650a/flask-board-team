@@ -1,5 +1,7 @@
 # 자동 권한 회수봇 실습 — 이 환경 기준
 
+> 2026-10-12: 게시판 코드를 `Git-Connection/_7_board_test` 기준으로 교체했습니다. 이 문서는 교체 전 코드(`controllers/authz.py`) 기준 기록이며, 현재 접근 제어는 `controllers/rbac.py`와 `docs/005_등급별_접근제어.md`를 참고합니다.
+
 준비일: 2026-09-16
 
 수업 자료는 `E:\0-Aleph-Python-Test\Python-Lab-ALeph-T\_7_board_test`와 `lsy` 계정을

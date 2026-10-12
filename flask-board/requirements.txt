@@ -63,3 +63,4 @@ urllib3==2.7.0
 wcwidth==0.8.3
 Werkzeug==3.1.8
 xlsxwriter==3.2.9
+pytest==9.1.1

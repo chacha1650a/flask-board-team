@@ -127,8 +127,26 @@ Dashboard 표에 Agent 이름을 표시하려면 위쪽의 **`columns hidden`**�
 | 09-28 | 강사님 연휴 업데이트 이식 — 인시던트 티켓 대시보드, 탐지 신호 4종(S5·S6·S9), SOAR 자기차단 수정 | 이 문서 "강사님 최신 보안 대응 코드 통합" |
 | 10-06 | Gobuster·Nikto 웹 스캔 — 404 탐지 로그 연결 복구, Graylog 이벤트·차단 후 재시도 확인 | 이 문서 "10-06 Gobuster 404 스캔 탐지 연결 복구" |
 | 10-08 | Wazuh 4.9.0 Dashboard·FIM 확인, 개인별 LLM 점검, Graylog Alerts 내보내기 | 이 문서 "10-08 Wazuh Dashboard 및 Graylog 설정 기록", `wazuh/README.md`, `graylog/exports/` |
+| 10-12 | 게시판 앱 코드를 개인 실습본(`Git-Connection/_7_board_test`) 기준으로 교체, Wazuh 3종 공격 재점검 | 이 문서 "10-12 게시판 코드 교체", `wazuh/README.md`, `image/wazuh_20261012/` |
 
-자동 테스트는 69개이고 모두 통과합니다(실행 방법은 맨 아래 부록).
+자동 테스트는 25개이고 모두 통과합니다(실행 방법은 맨 아래 부록).
+
+## 10-12 게시판 코드 교체
+
+게시판 앱 코드(`app.py`, `config.py`, `extensions.py`, `privilege_revoke_bot.py`,
+`controllers/`, `models/`, `templates/`, `tests/`)를 개인 실습본
+`Git-Connection/_7_board_test`와 같은 코드로 교체했습니다. 문서·`wazuh/`·`graylog/`·
+`scripts/`·`member_*` 폴더와 보조 스크립트(`alert_sender.py` 등)는 그대로 둡니다.
+
+| 구분 | 내용 |
+| --- | --- |
+| 추가 | `/api/gold/posts`, `/api/public/posts`, `controllers/rbac.py`·`gold_controller.py`, `pagination.py`(대시보드에는 아직 미연결), GELF `ip-block`·`priv-unauthorized-admin`, 404를 `security.log`에도 기록 |
+| 변경 | 회원 수정 `PATCH` → `PUT /api/admin/users/<id>`, 공공데이터 상세 `/public-posts/<uc_seq>` |
+| 제거 | `/api/auth/logout`, `/busan-travel`, `/public-post`, `controllers/authz.py`, `templates/403.html`, GELF `admin-auth-fail`·`blocked-retry`·`gold-access`·`login-success` |
+
+`.env`에는 `PUBLIC_API_URL`이 필요합니다(`.env.example` 참고). 코드 설명 문서는
+`docs/001`~`006`에 있습니다. `docs/ROLE-ACCESS-CONTROL.md`·`docs/PRIVILEGE-REVOKE-LAB.md`는
+교체 전 코드(`authz.py`) 기준 기록입니다.
 
 ---
 
@@ -738,7 +756,7 @@ GELF로 받은 `src_ip`, `syn_count`, `student`가 메시지 필드로 저장되
 | `alert_sender.py` | 경보를 만들어 n8n으로 보내는 전송기 |
 | `privilege_revoke_bot.py` | 허용목록 밖 관리자 탐지·GELF 신고·선택적 직접 회수 |
 | `controllers/security_controller.py` | 보안 이벤트 REST API |
-| `controllers/authz.py` | 등급별 접근 제어 판정 (`api_role_required` · `page_role_required`) |
+| `controllers/rbac.py` | 등급별 접근 제어 판정 |
 | `controllers/admin_controller.py` | 회원 관리와 관리자 보안 API, 자기 강등·자기 삭제·마지막 관리자 보호 |
 | `templates/dashboard.html` | 보안 대시보드 |
 | `graylog/docker-compose.yml` | Graylog · MongoDB · OpenSearch 실습 환경 |
@@ -758,19 +776,18 @@ GELF로 받은 `src_ip`, `syn_count`, `student`가 메시지 필드로 저장되
 | `scripts/*_n8n_*.js` | n8n 워크플로 점검·갱신·실행 확인 |
 | `scripts/relocate_environment.ps1` | 자리·PC를 옮긴 뒤 환경 재배치 (`docs/RELOCATION-RUNBOOK.md`) |
 | `docs/SUBMISSION-CHECKLIST.md` | 항목별 확인 기록 |
-| `tests/` | 자동 테스트 69개 |
+| `tests/` | 자동 테스트 25개 (pytest) |
 
 두 캡처 스크립트는 API 키와 DB 비밀번호를 **화면에 찍지 않습니다.** `.env`에서 읽어
 헤더와 컨테이너 환경변수로만 넘깁니다.
 
 ```powershell
-.venv\Scripts\python.exe -m unittest discover -s tests    # Ran 69 tests ... OK
+.venv\Scripts\python.exe -m pytest -q    # 25 passed
 ```
 
-`pytest`는 `requirements.txt`에 없어 표준 `unittest`로 돌립니다. 파일별로 전송기 4 ·
-게시판 5 · 등급별 접근 제어 29 · 권한 회수 봇 2 · 보안 대응 API 5 · 인시던트 대시보드 5 ·
-탐지 신호·자기차단 19개입니다. 테스트 설정은 `GELF_ENABLED = False`라 실습 Graylog로
-신호를 보내지 않습니다.
+파일별로 전송기 4 · 인시던트 대시보드 5 · 인시던트 2 · 로그인 성공 신호 4 · 공공데이터 API 4 ·
+웹 스캔 404 신호 6개입니다. `tests/conftest.py`가 GELF 소켓을 가로채므로 테스트가 실습
+Graylog로 신호를 보내지 않습니다.
 
 ## 강사님 최신 보안 대응 코드 통합
 
