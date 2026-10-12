@@ -132,15 +132,18 @@ EOF
 수업 자료: https://app.notion.com/p/wazuh_4-9_-d730741730ea82ed95b881c8f214105f
 볼륨 구성 참고: https://github.com/wazuh/wazuh-docker/blob/v4.9.0/single-node/docker-compose.yml
 
-## 사용자 디코더·룰
+## Manager 설정 파일 (`manager-etc/`)
 
-Manager의 사용자 디코더·룰은 Docker 볼륨에만 있어서 git으로 추적되지 않았습니다.
-현재 정상 동작이 확인된 파일을 이 폴더에 함께 보관합니다.
+Manager의 사용자 설정은 Docker 볼륨에만 있어서 git으로 추적되지 않았습니다.
+2026-10-12 3가지 공격 재점검에서 정상 동작이 확인된 파일을 `manager-etc/`에
+Manager의 `/var/ossec/etc` 구조 그대로 보관합니다.
 
-| 파일 | Manager 경로 |
+| 저장소 파일 | Manager 경로 |
 |---|---|
-| `local_decoder.xml` | `/var/ossec/etc/decoders/local_decoder.xml` |
-| `local_rules.xml` | `/var/ossec/etc/rules/local_rules.xml` |
+| `manager-etc/ossec.conf` | `/var/ossec/etc/ossec.conf` |
+| `manager-etc/decoders/local_decoder.xml` | `/var/ossec/etc/decoders/local_decoder.xml` |
+| `manager-etc/rules/local_rules.xml` | `/var/ossec/etc/rules/local_rules.xml` |
+| `manager-etc/shared/flask-board/agent.conf` | `/var/ossec/etc/shared/flask-board/agent.conf` |
 
 | 공격 | 디코더 | 룰 ID |
 |---|---|---|
@@ -148,6 +151,13 @@ Manager의 사용자 디코더·룰은 Docker 볼륨에만 있어서 git으로 �
 | 게시판 템플릿 위변조(FIM) | (syscheck) | 100220, 100221, 100222 |
 | Nikto·디렉터리 탐색 404 폭주 | `webapp-404` | 100230, 100231 |
 | Nmap·SQLmap (Suricata) | `suricata-alert` | 100240, 100241, 100242, 100243 |
+
+탐지 결과 화면은 [`image/wazuh_20261012/`](../image/wazuh_20261012/README.md)에 있습니다.
+
+`agent.conf`는 `board-host`가 읽는 로그(`security.log`, `suricata_alert.log`)와
+FIM 감시 폴더(`templates`)의 **개인 PC 경로**를 담고 있습니다. 다른 PC에서는
+위의 "이 경로는 자동으로 갱신되지 않습니다" 절차대로 경로를 바꿔서 적용합니다.
+`ossec.conf`의 `<syslog_output>`이 경보를 Graylog(`gl-graylog:5140`)로 보냅니다.
 
 Suricata 디코더는 JSON(`eve.json`) 원본이 아니라 포워더가 변환한 텍스트 한 줄을 읽습니다.
 밀리초(`.mmm`)가 빠지면 Wazuh 내장 프리디코더가 먼저 잡아가 미탐이 됩니다.
@@ -158,19 +168,20 @@ Suricata 디코더는 JSON(`eve.json`) 원본이 아니라 포워더가 변환�
 
 룰의 `<decoded_as>`는 디코더 `name`과 글자 하나까지 같아야 합니다(`suricata-alert`, 하이픈).
 다르면 `wazuh-analysisd`가 `Invalid decoder name`으로 기동을 거부합니다.
-적용 전에 반드시 설정 검사를 먼저 실행합니다.
+적용 전에 반드시 설정 검사를 먼저 실행합니다(게시판 프로젝트 루트 기준).
 
 ```powershell
-docker cp wazuh/local_decoder.xml wazuh-manager:/var/ossec/etc/decoders/local_decoder.xml
-docker cp wazuh/local_rules.xml wazuh-manager:/var/ossec/etc/rules/local_rules.xml
-docker exec wazuh-manager chown wazuh:wazuh /var/ossec/etc/decoders/local_decoder.xml /var/ossec/etc/rules/local_rules.xml
+docker cp wazuh/manager-etc/ossec.conf wazuh-manager:/var/ossec/etc/ossec.conf
+docker cp wazuh/manager-etc/decoders/local_decoder.xml wazuh-manager:/var/ossec/etc/decoders/local_decoder.xml
+docker cp wazuh/manager-etc/rules/local_rules.xml wazuh-manager:/var/ossec/etc/rules/local_rules.xml
+docker cp wazuh/manager-etc/shared/flask-board/agent.conf wazuh-manager:/var/ossec/etc/shared/flask-board/agent.conf
+docker exec wazuh-manager chown -R wazuh:wazuh /var/ossec/etc/decoders /var/ossec/etc/rules /var/ossec/etc/shared/flask-board
 docker exec wazuh-manager /var/ossec/bin/wazuh-analysisd -t
+docker exec wazuh-manager /var/ossec/bin/verify-agent-conf -f /var/ossec/etc/shared/flask-board/agent.conf
 docker exec wazuh-manager /var/ossec/bin/wazuh-control restart
 ```
 
 `wazuh-analysisd -t`가 아무 출력 없이 종료 코드 0으로 끝나야 재시작합니다.
-수집 대상 로그(`suricata_alert.log`)는 `flask-board` 그룹 `agent.conf`에
-`<localfile>`(`log_format`은 `syslog`)로 추가합니다.
 
 ## 2026-10-08 기동 검증
 
