@@ -132,6 +132,46 @@ EOF
 수업 자료: https://app.notion.com/p/wazuh_4-9_-d730741730ea82ed95b881c8f214105f
 볼륨 구성 참고: https://github.com/wazuh/wazuh-docker/blob/v4.9.0/single-node/docker-compose.yml
 
+## 사용자 디코더·룰
+
+Manager의 사용자 디코더·룰은 Docker 볼륨에만 있어서 git으로 추적되지 않았습니다.
+현재 정상 동작이 확인된 파일을 이 폴더에 함께 보관합니다.
+
+| 파일 | Manager 경로 |
+|---|---|
+| `local_decoder.xml` | `/var/ossec/etc/decoders/local_decoder.xml` |
+| `local_rules.xml` | `/var/ossec/etc/rules/local_rules.xml` |
+
+| 공격 | 디코더 | 룰 ID |
+|---|---|---|
+| Hydra 로그인 무차별 대입 | `webapp-login` | 100210, 100211 |
+| 게시판 템플릿 위변조(FIM) | (syscheck) | 100220, 100221, 100222 |
+| Nikto·디렉터리 탐색 404 폭주 | `webapp-404` | 100230, 100231 |
+| Nmap·SQLmap (Suricata) | `suricata-alert` | 100240, 100241, 100242, 100243 |
+
+Suricata 디코더는 JSON(`eve.json`) 원본이 아니라 포워더가 변환한 텍스트 한 줄을 읽습니다.
+밀리초(`.mmm`)가 빠지면 Wazuh 내장 프리디코더가 먼저 잡아가 미탐이 됩니다.
+
+```text
+2026-10-12 12:31:00.123 suricata_alert src_ip=203.0.113.77 sid=1000001 signature=LOCAL Portscan SYN detected
+```
+
+룰의 `<decoded_as>`는 디코더 `name`과 글자 하나까지 같아야 합니다(`suricata-alert`, 하이픈).
+다르면 `wazuh-analysisd`가 `Invalid decoder name`으로 기동을 거부합니다.
+적용 전에 반드시 설정 검사를 먼저 실행합니다.
+
+```powershell
+docker cp wazuh/local_decoder.xml wazuh-manager:/var/ossec/etc/decoders/local_decoder.xml
+docker cp wazuh/local_rules.xml wazuh-manager:/var/ossec/etc/rules/local_rules.xml
+docker exec wazuh-manager chown wazuh:wazuh /var/ossec/etc/decoders/local_decoder.xml /var/ossec/etc/rules/local_rules.xml
+docker exec wazuh-manager /var/ossec/bin/wazuh-analysisd -t
+docker exec wazuh-manager /var/ossec/bin/wazuh-control restart
+```
+
+`wazuh-analysisd -t`가 아무 출력 없이 종료 코드 0으로 끝나야 재시작합니다.
+수집 대상 로그(`suricata_alert.log`)는 `flask-board` 그룹 `agent.conf`에
+`<localfile>`(`log_format`은 `syslog`)로 추가합니다.
+
 ## 2026-10-08 기동 검증
 
 Manager·Indexer·Dashboard 모두 실행 중이며 `9_graylog_default`에 연결됩니다.
